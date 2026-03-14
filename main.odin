@@ -14,6 +14,7 @@ import xlib "vendor:x11/xlib"
 // ---------------------------------------------------------------------------
 
 foreign import clib "system:c"
+foreign import x11lib "system:X11"
 
 Pollfd :: struct {
 	fd:      c.int,
@@ -29,6 +30,11 @@ foreign clib {
 	pclose :: proc(stream: ^libc.FILE) -> c.int ---
 	fileno :: proc(stream: ^libc.FILE) -> c.int ---
 	poll :: proc(fds: ^Pollfd, nfds: c.ulong, timeout: c.int) -> c.int ---
+}
+
+@(default_calling_convention = "c")
+foreign x11lib {
+	XkbLockGroup :: proc(display: ^xlib.Display, device_spec: c.uint, group: c.uint) -> c.int ---
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +109,10 @@ BarData :: struct {
 	// Volume widget hit region (filled during draw)
 	vol_x:           i32,
 	vol_w:           i32,
+
+	// Kbd widget hit region (filled during draw)
+	kbd_x:           i32,
+	kbd_w:           i32,
 
 	battery_pct:     i32,
 	charging:        bool,
@@ -673,10 +683,12 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, screen_w: i32) {
 	}
 	draw_separator(&rx)
 
-	// Keyboard layout
+	// Keyboard layout — record hit region for mouse interaction
 	if data.kbd_layout != nil {
 		kbd_text := rl.TextFormat("%s %s", cstring(ICON_KBD), data.kbd_layout)
-		draw_right(&rx, font, kbd_text, ACCENT)
+		kx, kw := draw_right(&rx, font, kbd_text, ACCENT)
+		data.kbd_x = kx - 4
+		data.kbd_w = kw + PAD + 8
 	}
 }
 
@@ -707,6 +719,27 @@ handle_volume_input :: proc(data: ^BarData) {
 	if rl.IsMouseButtonPressed(.LEFT) {
 		run_cmd_fire("pamixer -t")
 		update_volume(data)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard layout mouse interaction
+// ---------------------------------------------------------------------------
+
+handle_kbd_input :: proc(data: ^BarData, display: ^xlib.Display) {
+	mx := rl.GetMouseX()
+	my := rl.GetMouseY()
+
+	over_kbd := mx >= data.kbd_x && mx <= data.kbd_x + data.kbd_w && my >= 0 && my < BAR_HEIGHT
+	if !over_kbd do return
+
+	if rl.IsMouseButtonPressed(.LEFT) {
+		state: xlib.XkbStateRec
+		xlib.XkbGetState(display, xlib.XkbUseCoreKbd, &state)
+		next := c.uint((int(state.group) + 1) % len(KBD_LAYOUTS))
+		XkbLockGroup(display, c.uint(xlib.XkbUseCoreKbd), next)
+		xlib.Flush(display)
+		update_kbd_layout(data, display)
 	}
 }
 
@@ -796,8 +829,9 @@ main :: proc() {
 			update_weather(&data)
 		}
 
-		// --- Volume mouse interaction ---
+		// --- Mouse interaction ---
 		handle_volume_input(&data)
+		handle_kbd_input(&data, x_display)
 
 		// --- Render ---
 		rl.BeginDrawing()
