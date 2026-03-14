@@ -60,7 +60,7 @@ TITLE_MAX_W :: 300
 TITLE_SCROLL_SPEED :: f32(40)
 TITLE_GAP :: f32(80)
 
-FONT_PATH :: "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf"
+FONT_PATH_FALLBACK :: "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf"
 
 Theme :: struct {
 	bg, fg, fg_dim, accent, green, yellow, red, surface: rl.Color,
@@ -237,6 +237,9 @@ BarData :: struct {
 	xembed_info:     xlib.Atom,
 	manager_atom:    xlib.Atom,
 	tray_x:          i32,
+
+	monitor_name:    [BUF_SM]u8,
+	monitor_name_len:int,
 }
 
 // ---------------------------------------------------------------------------
@@ -454,7 +457,8 @@ bspc_sub_poll :: proc(sub: ^BspcSub) -> bool {
 
 update_workspaces :: proc(data: ^BarData) {
 	buf: [512]u8
-	n := run_cmd("bspc query -D --names", buf[:])
+	mon := buf_cstr(data.monitor_name[:])
+	n := run_cmd(rl.TextFormat("bspc query -D -m %s --names", mon), buf[:])
 	if n == 0 do return
 
 	data.ws_count = 0
@@ -475,7 +479,7 @@ update_workspaces :: proc(data: ^BarData) {
 	}
 
 	focused: [BUF_SM]u8
-	fn := run_cmd("bspc query -D -d focused --names", focused[:])
+	fn := run_cmd(rl.TextFormat("bspc query -D -m %s -d focused --names", mon), focused[:])
 	data.focused_idx = -1
 	if fn > 0 {
 		focused_str := string(focused[:fn])
@@ -594,7 +598,20 @@ update_media :: proc(data: ^BarData) {
 // Font loading
 // ---------------------------------------------------------------------------
 
-load_font :: proc() -> rl.Font {
+get_system_mono_font :: proc() -> cstring {
+	buf: [512]u8
+	n := run_cmd("fc-match mono -f '%{file}'", buf[:])
+	if n > 0 {
+		// Copy to a persistent c string
+		result := make([]u8, n + 1)
+		for i in 0 ..< n { result[i] = buf[i] }
+		result[n] = 0
+		return transmute(cstring)raw_data(result)
+	}
+	return FONT_PATH_FALLBACK
+}
+
+load_font :: proc(font_path: cstring) -> rl.Font {
 	codepoints: [dynamic]rune
 	defer delete(codepoints)
 
@@ -631,7 +648,7 @@ load_font :: proc() -> rl.Font {
 		for cp in r[0] ..= r[1] {append(&codepoints, cp)}
 	}
 
-	font := rl.LoadFontEx(FONT_PATH, FONT_SIZE, raw_data(codepoints[:]), i32(len(codepoints)))
+	font := rl.LoadFontEx(font_path, FONT_SIZE, raw_data(codepoints[:]), i32(len(codepoints)))
 	rl.SetTextureFilter(font.texture, .BILINEAR)
 	return font
 }
@@ -647,7 +664,7 @@ load_emoji_font :: proc() -> rl.Font {
 // X11 dock setup
 // ---------------------------------------------------------------------------
 
-setup_dock :: proc(screen_w: i32) {
+setup_dock :: proc(screen_w: i32, mon_x: i32 = 0, mon_y: i32 = 0) {
 	glfw_handle := cast(glfw.WindowHandle)rl.GetWindowHandle()
 	display := glfw.GetX11Display()
 	window := glfw.GetX11Window(glfw_handle)
@@ -708,11 +725,11 @@ setup_dock :: proc(screen_w: i32) {
 	xlib.ChangeProperty(display, window, wm_desktop, cardinal, 32, xlib.PropModeReplace, &all_desktops, 1)
 
 	strut_partial := xlib.InternAtom(display, "_NET_WM_STRUT_PARTIAL", false)
-	struts: [12]c.long = {0, 0, c.long(BAR_HEIGHT), 0, 0, 0, 0, 0, 0, c.long(screen_w - 1), 0, 0}
+	struts: [12]c.long = {0, 0, c.long(BAR_HEIGHT + mon_y), 0, 0, 0, 0, 0, c.long(mon_x), c.long(mon_x + screen_w - 1), 0, 0}
 	xlib.ChangeProperty(display, window, strut_partial, cardinal, 32, xlib.PropModeReplace, &struts, 12)
 
 	strut_atom := xlib.InternAtom(display, "_NET_WM_STRUT", false)
-	struts_basic: [4]c.long = {0, 0, c.long(BAR_HEIGHT), 0}
+	struts_basic: [4]c.long = {0, 0, c.long(BAR_HEIGHT + mon_y), 0}
 	xlib.ChangeProperty(display, window, strut_atom, cardinal, 32, xlib.PropModeReplace, &struts_basic, 4)
 
 	xlib.Flush(display)
@@ -943,56 +960,19 @@ tray_capture_all :: proc(data: ^BarData, display: ^xlib.Display) {
 	}
 }
 
-handle_tray_input :: proc(data: ^BarData, display: ^xlib.Display) {
+// Move tray icon X11 windows to their actual draw positions.
+// XComposite redirect keeps them visually invisible, but their input
+// geometry becomes active so they receive real clicks from the X server
+// (avoiding the send_event flag that GTK3/Qt apps ignore).
+tray_update_positions :: proc(data: ^BarData, display: ^xlib.Display) {
 	if data.tray_count == 0 do return
-
-	mx := rl.GetMouseX()
-	my := rl.GetMouseY()
-	if my < 0 || my >= BAR_HEIGHT do return
-
-	// Find which icon was clicked
 	ix := data.tray_x
 	for i in 0 ..< data.tray_count {
 		if !data.tray_icons[i].mapped do continue
-		if mx >= ix && mx < ix + TRAY_ICON_SIZE {
-			// Translate to icon-local coordinates
-			local_x := i32(mx - ix)
-			local_y := i32(my - 4)
-
-			for btn in ([]rl.MouseButton{.LEFT, .MIDDLE, .RIGHT}) {
-				if !rl.IsMouseButtonPressed(btn) do continue
-
-				x11_btn: xlib.MouseButton
-				#partial switch btn {
-				case .LEFT:   x11_btn = .Button1
-				case .MIDDLE: x11_btn = .Button2
-				case .RIGHT:  x11_btn = .Button3
-				case: continue
-				}
-
-				// Send ButtonPress
-				ev: xlib.XEvent
-				ev.xbutton.type = .ButtonPress
-				ev.xbutton.window = data.tray_icons[i].window
-				ev.xbutton.root = xlib.DefaultRootWindow(display)
-				ev.xbutton.x = local_x
-				ev.xbutton.y = local_y
-				ev.xbutton.x_root = mx
-				ev.xbutton.y_root = my
-				ev.xbutton.button = x11_btn
-				ev.xbutton.same_screen = true
-				xlib.SendEvent(display, data.tray_icons[i].window, false, {}, &ev)
-
-				// Send ButtonRelease
-				ev.xbutton.type = .ButtonRelease
-				xlib.SendEvent(display, data.tray_icons[i].window, false, {}, &ev)
-
-				xlib.Flush(display)
-			}
-			return
-		}
+		xlib.MoveWindow(display, data.tray_icons[i].window, ix, 4)
 		ix += TRAY_ICON_SIZE + TRAY_ICON_GAP
 	}
+	xlib.Flush(display)
 }
 
 tray_has_icon :: proc(data: ^BarData, win: xlib.Window) -> bool {
@@ -1484,18 +1464,43 @@ main :: proc() {
 	rl.InitWindow(screen_w, BAR_HEIGHT, "bar")
 	defer rl.CloseWindow()
 
-	mon := rl.GetCurrentMonitor()
+	// Find the primary monitor via xrandr
+	mon: i32 = 0
+	{
+		px_buf: [BUF_SM]u8
+		py_buf: [BUF_SM]u8
+		px_n := run_cmd("xrandr --query | grep ' connected primary' | sed 's/.*[0-9]x[0-9]*+\\([0-9]*\\)+.*/\\1/'", px_buf[:])
+		py_n := run_cmd("xrandr --query | grep ' connected primary' | sed 's/.*+\\([0-9]*\\) .*/\\1/'", py_buf[:])
+		if px_n > 0 && py_n > 0 {
+			px, px_ok := strconv.parse_int(string(px_buf[:px_n]))
+			py, py_ok := strconv.parse_int(string(py_buf[:py_n]))
+			if px_ok && py_ok {
+				for m in 0 ..< rl.GetMonitorCount() {
+					pos := rl.GetMonitorPosition(m)
+					if i32(pos.x) == i32(px) && i32(pos.y) == i32(py) {
+						mon = m
+						break
+					}
+				}
+			}
+		}
+	}
+
 	screen_w = i32(rl.GetMonitorWidth(mon))
+	mon_pos := rl.GetMonitorPosition(mon)
+	mon_x := i32(mon_pos.x)
+	mon_y := i32(mon_pos.y)
 	rl.SetWindowSize(screen_w, BAR_HEIGHT)
-	rl.SetWindowPosition(0, 0)
+	rl.SetWindowPosition(mon_x, mon_y)
 	rl.SetTargetFPS(30)
 
-	setup_dock(screen_w)
+	setup_dock(screen_w, mon_x, mon_y)
 
 	// Now show — bspwm will see _NET_WM_WINDOW_TYPE_DOCK on first map
 	rl.ClearWindowState({.WINDOW_HIDDEN})
 
-	font := load_font()
+	font_path := get_system_mono_font()
+	font := load_font(font_path)
 	defer rl.UnloadFont(font)
 
 	emoji_font := load_emoji_font()
@@ -1521,6 +1526,7 @@ main :: proc() {
 	data: BarData
 	data.focused_idx = -1
 	data.kbd_layout = "??"
+	data.monitor_name_len = run_cmd("xrandr --query | grep ' connected primary' | cut -d' ' -f1", data.monitor_name[:])
 
 	// System tray
 	setup_tray(&data, x_display, bar_x11_win)
@@ -1571,9 +1577,9 @@ main :: proc() {
 			if fs != data.hidden {
 				data.hidden = fs
 				if fs {
-					rl.SetWindowPosition(0, -BAR_HEIGHT) // slide off screen
+					rl.SetWindowPosition(mon_x, mon_y - BAR_HEIGHT) // slide off screen
 				} else {
-					rl.SetWindowPosition(0, 0)
+					rl.SetWindowPosition(mon_x, mon_y)
 				}
 			}
 		}
@@ -1600,7 +1606,7 @@ main :: proc() {
 		handle_battery_input(&data)
 		handle_kbd_input(&data, x_display)
 		handle_media_input(&data)
-		handle_tray_input(&data, x_display)
+		tray_update_positions(&data, x_display)
 
 		// --- Cursor ---
 		{
