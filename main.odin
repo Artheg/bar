@@ -280,9 +280,25 @@ buf_cstr :: proc(buf: []u8) -> cstring {
 // X11 helpers
 // ---------------------------------------------------------------------------
 
+// Cached X11 atoms — resolved once, reused every frame.
+XAtomCache :: struct {
+	active_window: xlib.Atom,
+	wm_state:      xlib.Atom,
+	wm_state_fs:   xlib.Atom,
+	ready:         bool,
+}
+
+x_atoms: XAtomCache
+
+init_atom_cache :: proc(display: ^xlib.Display) {
+	x_atoms.active_window = xlib.InternAtom(display, "_NET_ACTIVE_WINDOW", false)
+	x_atoms.wm_state      = xlib.InternAtom(display, "_NET_WM_STATE", false)
+	x_atoms.wm_state_fs   = xlib.InternAtom(display, "_NET_WM_STATE_FULLSCREEN", false)
+	x_atoms.ready = true
+}
+
 get_active_window :: proc(display: ^xlib.Display) -> xlib.Window {
 	root := xlib.DefaultRootWindow(display)
-	active_atom := xlib.InternAtom(display, "_NET_ACTIVE_WINDOW", false)
 
 	act_type: [1]xlib.Atom
 	act_format: [1]i32
@@ -291,7 +307,7 @@ get_active_window :: proc(display: ^xlib.Display) -> xlib.Window {
 	prop: rawptr
 
 	xlib.GetWindowProperty(
-		display, root, active_atom, 0, 1, false, xlib.Atom(0),
+		display, root, x_atoms.active_window, 0, 1, false, xlib.Atom(0),
 		raw_data(act_type[:]), raw_data(act_format[:]),
 		raw_data(nitems[:]), raw_data(bytes_after[:]), &prop,
 	)
@@ -308,9 +324,6 @@ is_fullscreen :: proc(display: ^xlib.Display) -> bool {
 	active := get_active_window(display)
 	if active == xlib.Window(0) do return false
 
-	wm_state := xlib.InternAtom(display, "_NET_WM_STATE", false)
-	fs_atom := xlib.InternAtom(display, "_NET_WM_STATE_FULLSCREEN", false)
-
 	act_type: [1]xlib.Atom
 	act_format: [1]i32
 	nitems: [1]uint
@@ -318,7 +331,7 @@ is_fullscreen :: proc(display: ^xlib.Display) -> bool {
 	prop: rawptr
 
 	xlib.GetWindowProperty(
-		display, active, wm_state, 0, 32, false, xlib.XA_ATOM,
+		display, active, x_atoms.wm_state, 0, 32, false, xlib.XA_ATOM,
 		raw_data(act_type[:]), raw_data(act_format[:]),
 		raw_data(nitems[:]), raw_data(bytes_after[:]), &prop,
 	)
@@ -328,7 +341,7 @@ is_fullscreen :: proc(display: ^xlib.Display) -> bool {
 
 	atoms := cast([^]xlib.Atom)prop
 	for i in 0 ..< int(nitems[0]) {
-		if atoms[i] == fs_atom do return true
+		if atoms[i] == x_atoms.wm_state_fs do return true
 	}
 	return false
 }
@@ -1577,6 +1590,7 @@ main :: proc() {
 	defer rl.UnloadTexture(noise_tex)
 
 	x_display := glfw.GetX11Display()
+	init_atom_cache(x_display)
 	bar_x11_win := glfw.GetX11Window(cast(glfw.WindowHandle)rl.GetWindowHandle())
 
 	data: BarData
