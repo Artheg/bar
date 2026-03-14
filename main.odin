@@ -100,7 +100,7 @@ THEME_ORANGE :: Theme {
 	surface = {16, 20, 42, 255},
 }
 
-theme: Theme = THEME_ORANGE
+theme: Theme = THEME_MONO
 
 // Nerd Font icons (UTF-8)
 ICON_CLOCK :: "\xef\x80\x97"
@@ -167,6 +167,13 @@ BarData :: struct {
 
 	battery_pct:     i32,
 	charging:        bool,
+
+	// Battery widget hit region + tooltip
+	bat_x:           i32,
+	bat_w:           i32,
+	bat_time_buf:    [BUF_SM]u8,
+	bat_time_len:    int,
+	bat_tooltip:     f32, // >0 means visible, counts down
 
 	weather_buf:     [BUF_MD]u8,
 	weather_len:     int,
@@ -493,6 +500,11 @@ update_battery :: proc(data: ^BarData) {
 		data.charging = strings.contains(string(stat_data), "Charging")
 		delete(stat_data)
 	}
+	// Time remaining (e.g. "04:32:10" or "charging")
+	data.bat_time_len = run_cmd(
+		"acpi -b 2>/dev/null | head -1 | sed -n 's/.*\\([0-9][0-9]:[0-9][0-9]:[0-9][0-9]\\).*/\\1/p'",
+		data.bat_time_buf[:],
+	)
 }
 
 update_weather :: proc(data: ^BarData) {
@@ -782,7 +794,9 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 		bat_icon = cstring(ICON_BAT_EMPTY)
 	}
 	bat_text := rl.TextFormat("%s %d%%", bat_icon, data.battery_pct)
-	draw_right(&rx, font, bat_text, bat_col)
+	bx, bw := draw_right(&rx, font, bat_text, bat_col)
+	data.bat_x = bx - 4
+	data.bat_w = bw + PAD + 8
 	draw_separator(&rx)
 
 	// Volume — record hit region for mouse interaction
@@ -965,6 +979,56 @@ handle_volume_input :: proc(data: ^BarData) {
 }
 
 // ---------------------------------------------------------------------------
+// Battery mouse interaction + tooltip
+// ---------------------------------------------------------------------------
+
+handle_battery_input :: proc(data: ^BarData) {
+	mx := rl.GetMouseX()
+	my := rl.GetMouseY()
+
+	over_bat := mx >= data.bat_x && mx <= data.bat_x + data.bat_w && my >= 0 && my < BAR_HEIGHT
+
+	if over_bat && rl.IsMouseButtonPressed(.LEFT) {
+		// Toggle tooltip
+		if data.bat_tooltip > 0 {
+			data.bat_tooltip = 0
+		} else {
+			data.bat_tooltip = 3.0 // show for 3 seconds
+			update_battery(data)   // refresh on click
+		}
+	}
+
+	// Count down tooltip timer
+	if data.bat_tooltip > 0 {
+		data.bat_tooltip -= rl.GetFrameTime()
+	}
+}
+
+draw_battery_tooltip :: proc(data: ^BarData, font: rl.Font) {
+	if data.bat_tooltip <= 0 do return
+
+	tip: cstring
+	if data.bat_time_len > 0 {
+		tip = rl.TextFormat("%s remaining", buf_cstr(data.bat_time_buf[:]))
+	} else if data.charging {
+		tip = "Charging"
+	} else {
+		tip = "No estimate"
+	}
+
+	tw := measure(font, tip)
+	pad: i32 = 6
+	tip_w := tw + pad * 2
+	tip_h: i32 = BAR_HEIGHT - 4
+	tip_x := data.bat_x + data.bat_w / 2 - tip_w / 2
+	tip_y: i32 = 2
+
+	rl.DrawRectangle(tip_x, tip_y, tip_w, tip_h, theme.surface)
+	rl.DrawRectangleLines(tip_x, tip_y, tip_w, tip_h, theme.accent)
+	draw_text(font, tip, tip_x + pad, theme.fg)
+}
+
+// ---------------------------------------------------------------------------
 // Keyboard layout mouse interaction
 // ---------------------------------------------------------------------------
 
@@ -1134,6 +1198,7 @@ main :: proc() {
 
 		// --- Mouse interaction ---
 		handle_volume_input(&data)
+		handle_battery_input(&data)
 		handle_kbd_input(&data, x_display)
 		handle_media_input(&data)
 
@@ -1146,6 +1211,8 @@ main :: proc() {
 			if over_bar {
 				// Volume
 				if mx >= data.vol_x && mx <= data.vol_x + data.vol_w do hand = true
+				// Battery
+				if mx >= data.bat_x && mx <= data.bat_x + data.bat_w do hand = true
 				// Kbd
 				if mx >= data.kbd_x && mx <= data.kbd_x + data.kbd_w do hand = true
 				// Media buttons
@@ -1162,6 +1229,7 @@ main :: proc() {
 		rl.BeginDrawing()
 		rl.ClearBackground(theme.bg)
 		draw_bar(&data, font, emoji_font, screen_w)
+		draw_battery_tooltip(&data, font)
 
 		// --- Intro noise overlay ---
 		if intro_timer < INTRO_DURATION {
