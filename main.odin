@@ -52,15 +52,55 @@ TITLE_GAP :: f32(80)
 
 FONT_PATH :: "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf"
 
-// Catppuccin Mocha
-BG :: rl.Color{30, 30, 46, 216} // 0.85 opacity
-FG :: rl.Color{205, 214, 244, 255}
-FG_DIM :: rl.Color{108, 112, 134, 255}
-ACCENT :: rl.Color{137, 180, 250, 255}
-GREEN :: rl.Color{166, 227, 161, 255}
-YELLOW :: rl.Color{249, 226, 175, 255}
-RED :: rl.Color{243, 139, 168, 255}
-SURFACE :: rl.Color{49, 50, 68, 255}
+Theme :: struct {
+	bg, fg, fg_dim, accent, green, yellow, red, surface: rl.Color,
+}
+
+THEME_CATPPUCCIN :: Theme {
+	bg      = {30, 30, 46, 216},
+	fg      = {205, 214, 244, 255},
+	fg_dim  = {108, 112, 134, 255},
+	accent  = {137, 180, 250, 255},
+	green   = {166, 227, 161, 255},
+	yellow  = {249, 226, 175, 255},
+	red     = {243, 139, 168, 255},
+	surface = {49, 50, 68, 255},
+}
+
+THEME_FRESH_DAYS :: Theme {
+	bg      = {0, 0, 26, 216},
+	fg      = {220, 220, 220, 255},
+	fg_dim  = {156, 156, 156, 255},
+	accent  = {66, 156, 214, 255},
+	green   = {87, 166, 58, 255},
+	yellow  = {229, 192, 123, 255},
+	red     = {255, 85, 85, 255},
+	surface = {0, 11, 46, 255},
+}
+
+THEME_MONO :: Theme {
+	bg      = {12, 12, 12, 216},
+	fg      = {210, 210, 210, 255},
+	fg_dim  = {110, 110, 110, 255},
+	accent  = {240, 240, 240, 255},
+	green   = {170, 170, 170, 255},
+	yellow  = {190, 190, 190, 255},
+	red     = {140, 140, 140, 255},
+	surface = {30, 30, 30, 255},
+}
+
+THEME_ORANGE :: Theme {
+	bg      = {8, 10, 22, 216},
+	fg      = {235, 200, 155, 255},
+	fg_dim  = {150, 115, 80, 255},
+	accent  = {255, 150, 30, 255},
+	green   = {220, 180, 60, 255},
+	yellow  = {255, 200, 80, 255},
+	red     = {255, 90, 50, 255},
+	surface = {16, 20, 42, 255},
+}
+
+theme: Theme = THEME_ORANGE
 
 // Nerd Font icons (UTF-8)
 ICON_CLOCK :: "\xef\x80\x97"
@@ -88,6 +128,8 @@ KBD_LAYOUTS :: [?]cstring{"US", "RU"}
 
 BUF_SM :: 64
 BUF_MD :: 256
+
+INTRO_DURATION :: f32(1.5)
 
 // ---------------------------------------------------------------------------
 // Bar state
@@ -547,11 +589,6 @@ load_emoji_font :: proc() -> rl.Font {
 // ---------------------------------------------------------------------------
 
 setup_dock :: proc(screen_w: i32) {
-	{
-		buf: [4]u8
-		run_cmd("bspc rule -a bar manage=off sticky=on layer=above", buf[:])
-	}
-
 	glfw_handle := cast(glfw.WindowHandle)rl.GetWindowHandle()
 	display := glfw.GetX11Display()
 	window := glfw.GetX11Window(glfw_handle)
@@ -562,9 +599,20 @@ setup_dock :: proc(screen_w: i32) {
 	dock := xlib.InternAtom(display, "_NET_WM_WINDOW_TYPE_DOCK", false)
 	xlib.ChangeProperty(display, window, wm_type, xlib.XA_ATOM, 32, xlib.PropModeReplace, &dock, 1)
 
+	// Tell the WM this window does not accept input focus
+	hints := xlib.AllocWMHints()
+	if hints != nil {
+		hints.flags = {.InputHint}
+		hints.input = false
+		xlib.SetWMHints(display, window, hints)
+		xlib.Free(hints)
+	}
+
 	wm_state := xlib.InternAtom(display, "_NET_WM_STATE", false)
 	sticky := xlib.InternAtom(display, "_NET_WM_STATE_STICKY", false)
 	above := xlib.InternAtom(display, "_NET_WM_STATE_ABOVE", false)
+	skip_taskbar := xlib.InternAtom(display, "_NET_WM_STATE_SKIP_TASKBAR", false)
+	skip_pager := xlib.InternAtom(display, "_NET_WM_STATE_SKIP_PAGER", false)
 
 	send_wm_state :: proc(display: ^xlib.Display, root: xlib.Window, window: xlib.Window, atom: xlib.Atom, wm_state: xlib.Atom) {
 		ev: xlib.XEvent
@@ -580,9 +628,11 @@ setup_dock :: proc(screen_w: i32) {
 
 	send_wm_state(display, root, window, sticky, wm_state)
 	send_wm_state(display, root, window, above, wm_state)
+	send_wm_state(display, root, window, skip_taskbar, wm_state)
+	send_wm_state(display, root, window, skip_pager, wm_state)
 
-	state_atoms: [2]xlib.Atom = {sticky, above}
-	xlib.ChangeProperty(display, window, wm_state, xlib.XA_ATOM, 32, xlib.PropModeReplace, &state_atoms, 2)
+	state_atoms: [4]xlib.Atom = {sticky, above, skip_taskbar, skip_pager}
+	xlib.ChangeProperty(display, window, wm_state, xlib.XA_ATOM, 32, xlib.PropModeReplace, &state_atoms, 4)
 
 	wm_desktop := xlib.InternAtom(display, "_NET_WM_DESKTOP", false)
 	{
@@ -632,7 +682,7 @@ draw_right :: proc(rx: ^i32, font: rl.Font, text: cstring, color: rl.Color) -> (
 
 draw_separator :: proc(rx: ^i32) {
 	rx^ -= 6
-	rl.DrawRectangle(rx^, 7, 1, BAR_HEIGHT - 14, FG_DIM)
+	rl.DrawRectangle(rx^, 7, 1, BAR_HEIGHT - 14, theme.fg_dim)
 	rx^ -= 6
 }
 
@@ -650,8 +700,8 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 		is_focused := i == data.focused_idx
 		ws_w := measure(font, ws) + 14
 
-		bg_col := is_focused ? ACCENT : SURFACE
-		fg_col := is_focused ? BG : FG_DIM
+		bg_col := is_focused ? theme.accent : theme.surface
+		fg_col := is_focused ? theme.bg : theme.fg_dim
 
 		rl.DrawRectangle(x, 4, ws_w, BAR_HEIGHT - 8, bg_col)
 		draw_text(font, ws, x + 7, fg_col)
@@ -684,7 +734,7 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 		title_x := i32(start_x + icon_gap)
 
 		if title_w <= max_w {
-			draw_text(font, title, title_x, FG)
+			draw_text(font, title, title_x, theme.fg)
 			data.title_scroll = 0
 		} else {
 			data.title_scroll += TITLE_SCROLL_SPEED * dt
@@ -693,8 +743,8 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 				data.title_scroll -= cycle
 			}
 			rl.BeginScissorMode(title_x, 0, i32(max_w), BAR_HEIGHT)
-			draw_text(font, title, title_x - i32(data.title_scroll), FG)
-			draw_text(font, title, title_x + i32(cycle - data.title_scroll), FG)
+			draw_text(font, title, title_x - i32(data.title_scroll), theme.fg)
+			draw_text(font, title, title_x + i32(cycle - data.title_scroll), theme.fg)
 			rl.EndScissorMode()
 		}
 	}
@@ -704,19 +754,19 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 
 	// Time
 	time_text := rl.TextFormat("%s %02d:%02d:%02d", cstring(ICON_CLOCK), data.hour, data.min, data.sec)
-	draw_right(&rx, font, time_text, FG)
+	draw_right(&rx, font, time_text, theme.fg)
 	draw_separator(&rx)
 
 	// Weather
 	{
 		weather_text: cstring = data.weather_len > 0 ? buf_cstr(data.weather_buf[:]) : "Loading..."
-		weather_col: rl.Color = data.weather_len > 0 ? FG_DIM : SURFACE
+		weather_col: rl.Color = data.weather_len > 0 ? theme.fg_dim : theme.surface
 		draw_right(&rx, font, weather_text, weather_col)
 		draw_separator(&rx)
 	}
 
 	// Battery
-	bat_col := data.battery_pct > 50 ? GREEN : (data.battery_pct > 20 ? YELLOW : RED)
+	bat_col := data.battery_pct > 50 ? theme.green : (data.battery_pct > 20 ? theme.yellow : theme.red)
 	bat_icon: cstring
 	if data.charging {
 		bat_icon = cstring(ICON_BOLT)
@@ -738,13 +788,13 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 	// Volume — record hit region for mouse interaction
 	if data.muted {
 		vol_text := rl.TextFormat("%s MUTE", cstring(ICON_VOL_MUTE))
-		vx, vw := draw_right(&rx, font, vol_text, RED)
+		vx, vw := draw_right(&rx, font, vol_text, theme.red)
 		data.vol_x = vx - 4
 		data.vol_w = vw + PAD + 8
 	} else {
 		vol_icon: cstring = data.volume > 50 ? cstring(ICON_VOL_HIGH) : cstring(ICON_VOL_LOW)
 		vol_text := rl.TextFormat("%s %d%%", vol_icon, data.volume)
-		vx, vw := draw_right(&rx, font, vol_text, FG)
+		vx, vw := draw_right(&rx, font, vol_text, theme.fg)
 		data.vol_x = vx - 4
 		data.vol_w = vw + PAD + 8
 	}
@@ -753,7 +803,7 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 	// Keyboard layout — record hit region for mouse interaction
 	if data.kbd_layout != nil {
 		kbd_text := rl.TextFormat("%s %s", cstring(ICON_KBD), data.kbd_layout)
-		kx, kw := draw_right(&rx, font, kbd_text, ACCENT)
+		kx, kw := draw_right(&rx, font, kbd_text, theme.accent)
 		data.kbd_x = kx - 4
 		data.kbd_w = kw + PAD + 8
 	}
@@ -770,7 +820,7 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 		// Next button (rightmost)
 		rx -= btn_w
 		data.btn_next_x = rx
-		draw_text(emoji_font, cstring(ICON_NEXT), rx + 4, FG_DIM)
+		draw_text(emoji_font, cstring(ICON_NEXT), rx + 4, theme.fg_dim)
 
 		rx -= btn_gap
 
@@ -778,14 +828,14 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 		rx -= btn_w
 		data.btn_play_x = rx
 		play_icon: cstring = data.media_playing ? cstring(ICON_PAUSE) : cstring(ICON_PLAY)
-		draw_text(emoji_font, play_icon, rx + 4, ACCENT)
+		draw_text(emoji_font, play_icon, rx + 4, theme.accent)
 
 		rx -= btn_gap
 
 		// Prev button
 		rx -= btn_w
 		data.btn_prev_x = rx
-		draw_text(emoji_font, cstring(ICON_PREV), rx + 4, FG_DIM)
+		draw_text(emoji_font, cstring(ICON_PREV), rx + 4, theme.fg_dim)
 
 		rx -= 6
 
@@ -799,7 +849,7 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 		text_x := rx
 
 		if media_full_w <= media_max {
-			draw_text(font, media_text, text_x, FG_DIM)
+			draw_text(font, media_text, text_x, theme.fg_dim)
 			data.media_scroll = 0
 		} else {
 			data.media_scroll += MEDIA_SCROLL_SPEED * dt
@@ -808,14 +858,79 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 				data.media_scroll -= cycle
 			}
 			rl.BeginScissorMode(text_x, 0, i32(media_max), BAR_HEIGHT)
-			draw_text(font, media_text, text_x - i32(data.media_scroll), FG_DIM)
-			draw_text(font, media_text, text_x + i32(cycle - data.media_scroll), FG_DIM)
+			draw_text(font, media_text, text_x - i32(data.media_scroll), theme.fg_dim)
+			draw_text(font, media_text, text_x + i32(cycle - data.media_scroll), theme.fg_dim)
 			rl.EndScissorMode()
 		}
 
 		rx -= PAD
 	} else {
 		data.btn_w = 0
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Intro noise overlay
+// ---------------------------------------------------------------------------
+
+generate_intro_noise :: proc(pixels: []u8, w, h: i32, progress: f32) {
+	// progress: 0 = full noise, 1 = fully clear
+	density := (1 - progress) * (1 - progress) // quadratic falloff
+	max_alpha := u8(clamp(f32(255) * (1 - progress * 0.7), 0, 255))
+	block := i32(2)
+
+	for by in 0 ..< (h + block - 1) / block {
+		for bx in 0 ..< (w + block - 1) / block {
+			show := f32(rl.GetRandomValue(0, 1000)) / 1000.0 < density
+
+			r, g, b, a: u8
+			if show {
+				if progress < 0.4 && rl.GetRandomValue(0, 30) == 0 {
+					// Colored glitch pixel
+					r = u8(rl.GetRandomValue(0, 255))
+					g = u8(rl.GetRandomValue(0, 255))
+					b = u8(rl.GetRandomValue(100, 255))
+				} else {
+					gray := u8(rl.GetRandomValue(140, 255))
+					r = gray; g = gray; b = gray
+				}
+				a = max_alpha
+			}
+
+			for dy in 0 ..< block {
+				for dx in 0 ..< block {
+					px := bx * block + dx
+					py := by * block + dy
+					if px >= w || py >= h do continue
+					idx := int(py * w + px) * 4
+					pixels[idx + 0] = r
+					pixels[idx + 1] = g
+					pixels[idx + 2] = b
+					pixels[idx + 3] = a
+				}
+			}
+		}
+	}
+
+	// Bright horizontal glitch scanlines
+	if progress < 0.6 {
+		band_count := i32(f32(3) * (1 - progress / 0.6))
+		for _ in 0 ..< band_count {
+			band_y := rl.GetRandomValue(0, h - 1)
+			band_h := rl.GetRandomValue(1, 3)
+			brightness := u8(rl.GetRandomValue(200, 255))
+			for dy in 0 ..< band_h {
+				py := band_y + dy
+				if py >= h do continue
+				for px in 0 ..< w {
+					idx := int(py * w + px) * 4
+					pixels[idx + 0] = brightness
+					pixels[idx + 1] = brightness
+					pixels[idx + 2] = brightness
+					pixels[idx + 3] = max_alpha
+				}
+			}
+		}
 	}
 }
 
@@ -898,11 +1013,24 @@ handle_media_input :: proc(data: ^BarData) {
 // Main
 // ---------------------------------------------------------------------------
 
+x11_error_handler :: proc "c" (display: ^xlib.Display, event: ^xlib.XErrorEvent) -> i32 {
+	// Ignore non-fatal X11 errors (e.g. compositor dying)
+	return 0
+}
+
 main :: proc() {
+	xlib.SetErrorHandler(x11_error_handler)
+
 	screen_w := i32(1920)
 
-	// Remove MOUSE_PASSTHROUGH so volume widget can receive clicks/scroll
-	rl.SetConfigFlags({.WINDOW_UNDECORATED, .WINDOW_TOPMOST, .WINDOW_TRANSPARENT})
+	// Set up bspc rule BEFORE creating the window so bspwm won't manage it
+	{
+		buf: [4]u8
+		run_cmd("bspc rule -a bar manage=off sticky=on layer=above", buf[:])
+	}
+
+	// Create hidden so we can set DOCK type before bspwm ever sees the window
+	rl.SetConfigFlags({.WINDOW_UNDECORATED, .WINDOW_TOPMOST, .WINDOW_TRANSPARENT, .WINDOW_HIDDEN})
 	rl.InitWindow(screen_w, BAR_HEIGHT, "bar")
 	defer rl.CloseWindow()
 
@@ -914,11 +1042,28 @@ main :: proc() {
 
 	setup_dock(screen_w)
 
+	// Now show — bspwm will see _NET_WM_WINDOW_TYPE_DOCK on first map
+	rl.ClearWindowState({.WINDOW_HIDDEN})
+
 	font := load_font()
 	defer rl.UnloadFont(font)
 
 	emoji_font := load_emoji_font()
 	defer rl.UnloadFont(emoji_font)
+
+	// Intro noise overlay
+	intro_timer: f32 = 0
+	noise_pixels := make([]u8, int(screen_w) * BAR_HEIGHT * 4)
+	defer delete(noise_pixels)
+	noise_img := rl.Image {
+		data    = raw_data(noise_pixels),
+		width   = screen_w,
+		height  = BAR_HEIGHT,
+		mipmaps = 1,
+		format  = .UNCOMPRESSED_R8G8B8A8,
+	}
+	noise_tex := rl.LoadTextureFromImage(noise_img)
+	defer rl.UnloadTexture(noise_tex)
 
 	x_display := glfw.GetX11Display()
 
@@ -1015,8 +1160,18 @@ main :: proc() {
 
 		// --- Render ---
 		rl.BeginDrawing()
-		rl.ClearBackground(BG)
+		rl.ClearBackground(theme.bg)
 		draw_bar(&data, font, emoji_font, screen_w)
+
+		// --- Intro noise overlay ---
+		if intro_timer < INTRO_DURATION {
+			intro_timer += rl.GetFrameTime()
+			t := clamp(intro_timer / INTRO_DURATION, 0, 1)
+			generate_intro_noise(noise_pixels, screen_w, BAR_HEIGHT, t)
+			rl.UpdateTexture(noise_tex, raw_data(noise_pixels))
+			rl.DrawTexture(noise_tex, 0, 0, rl.WHITE)
+		}
+
 		rl.EndDrawing()
 	}
 
