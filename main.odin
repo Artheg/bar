@@ -167,8 +167,12 @@ TrayIcon :: struct {
 
 BarData :: struct {
 	ws_bufs:         [16][BUF_SM]u8,
+	ws_ids:          [16][BUF_SM]u8, // desktop IDs (hex) for unambiguous switching
 	ws_count:        int,
 	focused_idx:     int,
+	ws_x:            [16]i32,
+	ws_w:            [16]i32,
+	ws_end:          i32, // right edge of the entire workspace widget
 
 	title_buf:       [BUF_MD]u8,
 	title_len:       int,
@@ -455,38 +459,49 @@ bspc_sub_poll :: proc(sub: ^BspcSub) -> bool {
 // Data update procs
 // ---------------------------------------------------------------------------
 
-update_workspaces :: proc(data: ^BarData) {
-	buf: [512]u8
-	mon := buf_cstr(data.monitor_name[:])
-	n := run_cmd(rl.TextFormat("bspc query -D -m %s --names", mon), buf[:])
-	if n == 0 do return
-
-	data.ws_count = 0
+parse_lines :: proc(raw: []u8, n: int, out: [][BUF_SM]u8) -> int {
+	count := 0
 	start := 0
 	for i in 0 ..= n {
-		if i == n || buf[i] == '\n' {
+		if i == n || raw[i] == '\n' {
 			line_len := i - start
-			if line_len > 0 && data.ws_count < len(data.ws_bufs) {
+			if line_len > 0 && count < len(out) {
 				copy_len := min(line_len, BUF_SM - 1)
 				for j in 0 ..< copy_len {
-					data.ws_bufs[data.ws_count][j] = buf[start + j]
+					out[count][j] = raw[start + j]
 				}
-				data.ws_bufs[data.ws_count][copy_len] = 0
-				data.ws_count += 1
+				out[count][copy_len] = 0
+				count += 1
 			}
 			start = i + 1
 		}
 	}
+	return count
+}
+
+update_workspaces :: proc(data: ^BarData) {
+	mon := buf_cstr(data.monitor_name[:])
+
+	buf: [512]u8
+	n := run_cmd(rl.TextFormat("bspc query -D -m %s --names", mon), buf[:])
+	if n == 0 do return
+	data.ws_count = parse_lines(buf[:], n, data.ws_bufs[:])
+
+	id_buf: [512]u8
+	id_n := run_cmd(rl.TextFormat("bspc query -D -m %s", mon), id_buf[:])
+	if id_n > 0 {
+		parse_lines(id_buf[:], id_n, data.ws_ids[:])
+	}
 
 	focused: [BUF_SM]u8
-	fn := run_cmd(rl.TextFormat("bspc query -D -m %s -d focused --names", mon), focused[:])
+	fn := run_cmd(rl.TextFormat("bspc query -D -m %s -d focused", mon), focused[:])
 	data.focused_idx = -1
 	if fn > 0 {
 		focused_str := string(focused[:fn])
 		for i in 0 ..< data.ws_count {
-			ws_len := 0
-			for ws_len < BUF_SM && data.ws_bufs[i][ws_len] != 0 {ws_len += 1}
-			if string(data.ws_bufs[i][:ws_len]) == focused_str {
+			id_len := 0
+			for id_len < BUF_SM && data.ws_ids[i][id_len] != 0 {id_len += 1}
+			if string(data.ws_ids[i][:id_len]) == focused_str {
 				data.focused_idx = i
 				break
 			}
@@ -1060,10 +1075,13 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 		bg_col := is_focused ? theme.accent : theme.surface
 		fg_col := is_focused ? theme.bg : theme.fg_dim
 
+		data.ws_x[i] = x
+		data.ws_w[i] = ws_w
 		rl.DrawRectangle(x, 4, ws_w, BAR_HEIGHT - 8, bg_col)
 		draw_text(font, ws, x + 7, fg_col)
 		x += ws_w + 4
 	}
+	data.ws_end = x
 
 	// --- Right: status items (drawn right-to-left) ---
 	rx: i32 = screen_w - PAD
@@ -1308,6 +1326,44 @@ generate_intro_noise :: proc(pixels: []u8, w, h: i32, progress: f32) {
 					pixels[idx + 3] = max_alpha
 				}
 			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Workspace mouse interaction
+// ---------------------------------------------------------------------------
+
+handle_workspace_input :: proc(data: ^BarData) {
+	if data.ws_count == 0 do return
+
+	mx := rl.GetMouseX()
+	my := rl.GetMouseY()
+	if my < 0 || my >= BAR_HEIGHT do return
+
+	mon := buf_cstr(data.monitor_name[:])
+
+	// Click: switch to workspace by ID (names are ambiguous across monitors)
+	if rl.IsMouseButtonPressed(.LEFT) {
+		for i in 0 ..< data.ws_count {
+			if mx >= data.ws_x[i] && mx < data.ws_x[i] + data.ws_w[i] {
+				ws_id := buf_cstr(data.ws_ids[i][:])
+				run_cmd_fire(rl.TextFormat("bspc desktop -f %s", ws_id))
+				update_workspaces(data)
+				return
+			}
+		}
+	}
+
+	// Scroll wheel: cycle workspaces (anywhere over the widget area)
+	if mx >= 0 && mx < data.ws_end {
+		wheel := rl.GetMouseWheelMove()
+		if wheel > 0 {
+			run_cmd_fire(rl.TextFormat("bspc desktop -f prev.local -m %s", mon))
+			update_workspaces(data)
+		} else if wheel < 0 {
+			run_cmd_fire(rl.TextFormat("bspc desktop -f next.local -m %s", mon))
+			update_workspaces(data)
 		}
 	}
 }
@@ -1602,6 +1658,7 @@ main :: proc() {
 		}
 
 		// --- Mouse interaction ---
+		handle_workspace_input(&data)
 		handle_volume_input(&data)
 		handle_battery_input(&data)
 		handle_kbd_input(&data, x_display)
@@ -1615,6 +1672,8 @@ main :: proc() {
 			over_bar := my >= 0 && my < BAR_HEIGHT
 			hand := false
 			if over_bar {
+				// Workspaces
+				if mx >= 0 && mx < data.ws_end do hand = true
 				// Volume
 				if mx >= data.vol_x && mx <= data.vol_x + data.vol_w do hand = true
 				// Battery
