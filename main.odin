@@ -46,7 +46,7 @@ FONT_SIZE :: 18
 FONT_SPACING :: f32(1)
 PAD :: 14
 
-TITLE_MAX_W :: 400
+TITLE_MAX_W :: 300
 TITLE_SCROLL_SPEED :: f32(40)
 TITLE_GAP :: f32(80)
 
@@ -74,6 +74,13 @@ ICON_VOL_HIGH :: "\xef\x80\xa8"
 ICON_VOL_LOW :: "\xef\x80\xa7"
 ICON_VOL_MUTE :: "\xef\x80\xa6"
 ICON_KBD :: "\xef\x84\x9c"
+ICON_PLAY :: "\xef\x80\x9a"
+ICON_PAUSE :: "\xef\x80\x9c"
+ICON_PREV :: "\xef\x80\x88"
+ICON_NEXT :: "\xef\x80\x89"
+
+MEDIA_MAX_W :: 350
+MEDIA_SCROLL_SPEED :: f32(35)
 
 KBD_LAYOUTS :: [?]cstring{"US", "RU"}
 
@@ -121,6 +128,21 @@ BarData :: struct {
 	weather_len:     int,
 
 	hidden:          bool, // hidden behind fullscreen window
+
+	// Playerctl
+	media_player:    [BUF_SM]u8,
+	media_player_len:int,
+	media_buf:       [BUF_MD]u8,
+	media_len:       int,
+	media_scroll:    f32,
+	media_active:    bool,
+	media_playing:   bool,
+
+	// Media button hit regions (filled during draw)
+	btn_prev_x:      i32,
+	btn_play_x:      i32,
+	btn_next_x:      i32,
+	btn_w:           i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +455,38 @@ update_weather :: proc(data: ^BarData) {
 	data.weather_len = run_cmd("curl -s --max-time 5 'wttr.in/?format=%C+%t' 2>/dev/null", data.weather_buf[:])
 }
 
+PLAYERCTL_FIND_PLAYING :: "playerctl -l 2>/dev/null | while read p; do [ \"$(playerctl -p \"$p\" status 2>/dev/null)\" = \"Playing\" ] && echo \"$p\" && break; done"
+PLAYERCTL_FIND_PAUSED :: "playerctl -l 2>/dev/null | while read p; do [ \"$(playerctl -p \"$p\" status 2>/dev/null)\" = \"Paused\" ] && echo \"$p\" && break; done"
+
+update_media :: proc(data: ^BarData) {
+	// Find playing player first, then paused
+	data.media_player_len = run_cmd(PLAYERCTL_FIND_PLAYING, data.media_player[:])
+	if data.media_player_len > 0 {
+		data.media_playing = true
+	} else {
+		data.media_player_len = run_cmd(PLAYERCTL_FIND_PAUSED, data.media_player[:])
+		data.media_playing = false
+	}
+
+	if data.media_player_len == 0 {
+		data.media_active = false
+		data.media_len = 0
+		return
+	}
+
+	data.media_active = true
+
+	old_len := data.media_len
+	old_first: u8 = data.media_len > 0 ? data.media_buf[0] : 0
+	data.media_len = run_cmd(
+		rl.TextFormat("songname %s 2>/dev/null", buf_cstr(data.media_player[:])),
+		data.media_buf[:],
+	)
+	if data.media_len != old_len || (data.media_len > 0 && data.media_buf[0] != old_first) {
+		data.media_scroll = 0
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Font loading
 // ---------------------------------------------------------------------------
@@ -603,7 +657,7 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, screen_w: i32) {
 		icon_gap := data.icon_valid ? icon_size + 6 : f32(0)
 		visible_title_w := min(title_w, max_w)
 		content_w := icon_gap + visible_title_w
-		start_x := (f32(screen_w) - content_w) / 2
+		start_x := (f32(screen_w) * 0.38) - content_w / 2
 
 		if data.icon_valid {
 			aspect := f32(data.icon_tex.width) / max(f32(data.icon_tex.height), 1)
@@ -690,6 +744,66 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, screen_w: i32) {
 		data.kbd_x = kx - 4
 		data.kbd_w = kw + PAD + 8
 	}
+
+	// Media (playerctl) — left of kbd widget
+	if data.media_active && data.media_len > 0 {
+		draw_separator(&rx)
+
+		// Buttons: prev | play/pause | next
+		btn_w := i32(measure(font, cstring(ICON_NEXT))) + 8
+		data.btn_w = btn_w
+		btn_gap: i32 = 2
+
+		// Next button (rightmost)
+		rx -= btn_w
+		data.btn_next_x = rx
+		draw_text(font, cstring(ICON_NEXT), rx + 4, FG_DIM)
+
+		rx -= btn_gap
+
+		// Play/pause button
+		rx -= btn_w
+		data.btn_play_x = rx
+		play_icon: cstring = data.media_playing ? cstring(ICON_PAUSE) : cstring(ICON_PLAY)
+		draw_text(font, play_icon, rx + 4, ACCENT)
+
+		rx -= btn_gap
+
+		// Prev button
+		rx -= btn_w
+		data.btn_prev_x = rx
+		draw_text(font, cstring(ICON_PREV), rx + 4, FG_DIM)
+
+		rx -= 6
+
+		// Song text with marquee
+		media_text := buf_cstr(data.media_buf[:])
+		media_full_w := f32(measure(font, media_text))
+		media_max := f32(MEDIA_MAX_W)
+		visible_media_w := i32(min(media_full_w, media_max))
+
+		rx -= visible_media_w
+		text_x := rx
+
+		if media_full_w <= media_max {
+			draw_text(font, media_text, text_x, FG_DIM)
+			data.media_scroll = 0
+		} else {
+			data.media_scroll += MEDIA_SCROLL_SPEED * dt
+			cycle := media_full_w + TITLE_GAP
+			if data.media_scroll >= cycle {
+				data.media_scroll -= cycle
+			}
+			rl.BeginScissorMode(text_x, 0, i32(media_max), BAR_HEIGHT)
+			draw_text(font, media_text, text_x - i32(data.media_scroll), FG_DIM)
+			draw_text(font, media_text, text_x + i32(cycle - data.media_scroll), FG_DIM)
+			rl.EndScissorMode()
+		}
+
+		rx -= PAD
+	} else {
+		data.btn_w = 0
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +858,30 @@ handle_kbd_input :: proc(data: ^BarData, display: ^xlib.Display) {
 }
 
 // ---------------------------------------------------------------------------
+// Media mouse interaction
+// ---------------------------------------------------------------------------
+
+handle_media_input :: proc(data: ^BarData) {
+	if data.btn_w <= 0 || data.media_player_len == 0 do return
+	if !rl.IsMouseButtonPressed(.LEFT) do return
+
+	mx := rl.GetMouseX()
+	my := rl.GetMouseY()
+	if my < 0 || my >= BAR_HEIGHT do return
+
+	player := buf_cstr(data.media_player[:])
+	w := data.btn_w
+
+	if mx >= data.btn_prev_x && mx < data.btn_prev_x + w {
+		run_cmd_fire(rl.TextFormat("playerctl -p %s previous &", player))
+	} else if mx >= data.btn_play_x && mx < data.btn_play_x + w {
+		run_cmd_fire(rl.TextFormat("playerctl -p %s play-pause &", player))
+	} else if mx >= data.btn_next_x && mx < data.btn_next_x + w {
+		run_cmd_fire(rl.TextFormat("playerctl -p %s next &", player))
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -778,10 +916,13 @@ main :: proc() {
 	last_fast: f64 = -9999
 	last_medium: f64 = -9999
 	last_slow: f64 = -9999
-	last_weather: f64 = -9999
+	last_weather: f64 = -597 // fires ~3s after launch, not on first frame
+	frame: int = 0
 
-	// Initial workspace fetch
+	// Initial fast fetches only
 	update_workspaces(&data)
+	update_time(&data)
+	update_kbd_layout(&data, x_display)
 
 	for !rl.WindowShouldClose() {
 		now := rl.GetTime()
@@ -817,6 +958,7 @@ main :: proc() {
 			last_medium = now
 			update_time(&data)
 			update_volume(&data)
+			update_media(&data)
 		}
 
 		if now - last_slow >= 30.0 {
@@ -832,6 +974,28 @@ main :: proc() {
 		// --- Mouse interaction ---
 		handle_volume_input(&data)
 		handle_kbd_input(&data, x_display)
+		handle_media_input(&data)
+
+		// --- Cursor ---
+		{
+			mx := rl.GetMouseX()
+			my := rl.GetMouseY()
+			over_bar := my >= 0 && my < BAR_HEIGHT
+			hand := false
+			if over_bar {
+				// Volume
+				if mx >= data.vol_x && mx <= data.vol_x + data.vol_w do hand = true
+				// Kbd
+				if mx >= data.kbd_x && mx <= data.kbd_x + data.kbd_w do hand = true
+				// Media buttons
+				if data.btn_w > 0 {
+					if mx >= data.btn_prev_x && mx < data.btn_prev_x + data.btn_w do hand = true
+					if mx >= data.btn_play_x && mx < data.btn_play_x + data.btn_w do hand = true
+					if mx >= data.btn_next_x && mx < data.btn_next_x + data.btn_w do hand = true
+				}
+			}
+			rl.SetMouseCursor(hand ? .POINTING_HAND : .DEFAULT)
+		}
 
 		// --- Render ---
 		rl.BeginDrawing()
