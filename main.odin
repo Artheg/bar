@@ -15,6 +15,7 @@ import xlib "vendor:x11/xlib"
 
 foreign import clib "system:c"
 foreign import x11lib "system:X11"
+foreign import xcomplib "system:Xcomposite"
 
 Pollfd :: struct {
 	fd:      c.int,
@@ -36,6 +37,15 @@ foreign clib {
 foreign x11lib {
 	XkbLockGroup :: proc(display: ^xlib.Display, device_spec: c.uint, group: c.uint) -> c.int ---
 }
+
+@(default_calling_convention = "c")
+foreign xcomplib {
+	XCompositeRedirectWindow :: proc(display: ^xlib.Display, window: xlib.Window, update: c.int) ---
+	XCompositeUnredirectWindow :: proc(display: ^xlib.Display, window: xlib.Window, update: c.int) ---
+	XCompositeNameWindowPixmap :: proc(display: ^xlib.Display, window: xlib.Window) -> xlib.Pixmap ---
+}
+
+COMPOSITE_REDIRECT_MANUAL :: c.int(1)
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -131,6 +141,26 @@ BUF_MD :: 256
 
 INTRO_DURATION :: f32(1.5)
 
+// System tray / XEmbed constants
+TRAY_ICON_SIZE :: BAR_HEIGHT - 8
+TRAY_ICON_GAP :: 2
+MAX_TRAY_ICONS :: 32
+
+SYSTEM_TRAY_REQUEST_DOCK :: 0
+SYSTEM_TRAY_BEGIN_MESSAGE :: 1
+SYSTEM_TRAY_CANCEL_MESSAGE :: 2
+
+XEMBED_EMBEDDED_NOTIFY :: 0
+XEMBED_MAPPED :: 1 << 0
+XEMBED_VERSION :: 0
+
+TrayIcon :: struct {
+	window:    xlib.Window,
+	mapped:    bool,
+	tex:       rl.Texture2D,
+	tex_valid: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Bar state
 // ---------------------------------------------------------------------------
@@ -167,6 +197,7 @@ BarData :: struct {
 
 	battery_pct:     i32,
 	charging:        bool,
+	has_battery:     bool,
 
 	// Battery widget hit region + tooltip
 	bat_x:           i32,
@@ -194,6 +225,18 @@ BarData :: struct {
 	btn_play_x:      i32,
 	btn_next_x:      i32,
 	btn_w:           i32,
+
+	// System tray (uses its own X connection to avoid GLFW eating events)
+	tray_display:    ^xlib.Display,
+	tray_icons:      [MAX_TRAY_ICONS]TrayIcon,
+	tray_count:      int,
+	tray_sel_win:    xlib.Window,
+	tray_opcode:     xlib.Atom,
+	tray_atom:       xlib.Atom,
+	xembed_atom:     xlib.Atom,
+	xembed_info:     xlib.Atom,
+	manager_atom:    xlib.Atom,
+	tray_x:          i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -492,9 +535,13 @@ update_volume :: proc(data: ^BarData) {
 
 update_battery :: proc(data: ^BarData) {
 	if cap_data, ok := os.read_entire_file("/sys/class/power_supply/BAT0/capacity"); ok {
+		data.has_battery = true
 		v, parse_ok := strconv.parse_int(strings.trim_space(string(cap_data)))
 		if parse_ok do data.battery_pct = i32(v)
 		delete(cap_data)
+	} else {
+		data.has_battery = false
+		return
 	}
 	if stat_data, ok := os.read_entire_file("/sys/class/power_supply/BAT0/status"); ok {
 		data.charging = strings.contains(string(stat_data), "Charging")
@@ -672,8 +719,326 @@ setup_dock :: proc(screen_w: i32) {
 }
 
 // ---------------------------------------------------------------------------
-// Drawing helpers
+// System tray
 // ---------------------------------------------------------------------------
+
+setup_tray :: proc(data: ^BarData, display: ^xlib.Display, bar_window: xlib.Window) {
+	// Open a SEPARATE X connection for tray events.
+	// GLFW's event loop drains all events from the main connection via XNextEvent,
+	// which silently drops our tray dock requests. A separate connection has its
+	// own event queue that GLFW never touches.
+	data.tray_display = xlib.OpenDisplay(nil)
+	if data.tray_display == nil do return
+
+	td := data.tray_display
+	root := xlib.DefaultRootWindow(td)
+	cardinal := xlib.InternAtom(td, "CARDINAL", false)
+
+	data.tray_opcode = xlib.InternAtom(td, "_NET_SYSTEM_TRAY_OPCODE", false)
+	data.tray_atom = xlib.InternAtom(td, "_NET_SYSTEM_TRAY_S0", false)
+	data.xembed_atom = xlib.InternAtom(td, "_XEMBED", false)
+	data.xembed_info = xlib.InternAtom(td, "_XEMBED_INFO", false)
+	data.manager_atom = xlib.InternAtom(td, "MANAGER", false)
+
+	// Create hidden 1x1 selection owner window
+	data.tray_sel_win = xlib.CreateSimpleWindow(td, root, -1, -1, 1, 1, 0, 0, 0)
+
+	// Set tray orientation to horizontal
+	orientation := xlib.InternAtom(td, "_NET_SYSTEM_TRAY_ORIENTATION", false)
+	orient_val: c.ulong = 0 // HORIZONTAL
+	xlib.ChangeProperty(td, data.tray_sel_win, orientation, cardinal, 32, xlib.PropModeReplace, &orient_val, 1)
+
+	// Tell apps to use the bar's visual (depth 32) for tray icons,
+	// so they can be reparented into the bar window without BadMatch.
+	bar_attrs: xlib.XWindowAttributes
+	xlib.GetWindowAttributes(display, bar_window, &bar_attrs)
+	if bar_attrs.visual != nil {
+		visual_atom := xlib.InternAtom(td, "_NET_SYSTEM_TRAY_VISUAL", false)
+		xa_visualid := xlib.Atom(32) // XA_VISUALID
+		vis_id := c.ulong(bar_attrs.visual.visualid)
+		xlib.ChangeProperty(td, data.tray_sel_win, visual_atom, xa_visualid, 32, xlib.PropModeReplace, &vis_id, 1)
+	}
+
+	// Acquire selection
+	xlib.SetSelectionOwner(td, data.tray_atom, data.tray_sel_win, xlib.CurrentTime)
+	if xlib.GetSelectionOwner(td, data.tray_atom) != data.tray_sel_win {
+		xlib.CloseDisplay(td)
+		data.tray_display = nil
+		return // failed — another tray manager is running
+	}
+
+	// Broadcast MANAGER client message to root
+	ev: xlib.XEvent
+	ev.xclient.type = .ClientMessage
+	ev.xclient.window = root
+	ev.xclient.message_type = data.manager_atom
+	ev.xclient.format = 32
+	ev.xclient.data.l[0] = int(xlib.CurrentTime)
+	ev.xclient.data.l[1] = int(data.tray_atom)
+	ev.xclient.data.l[2] = int(data.tray_sel_win)
+	xlib.SendEvent(td, root, false, {.StructureNotify}, &ev)
+
+	xlib.Flush(td)
+}
+
+// Silently ignore X errors (e.g. BadWindow from destroyed snixembed windows)
+x_error_handler :: proc "c" (_: ^xlib.Display, _: ^xlib.XErrorEvent) -> i32 { return 0 }
+
+tray_dock_icon :: proc(data: ^BarData, display: ^xlib.Display, bar_window: xlib.Window, icon_win: xlib.Window) {
+	if data.tray_count >= MAX_TRAY_ICONS do return
+	if data.tray_display == nil do return
+
+	// Check not already docked
+	for i in 0 ..< data.tray_count {
+		if data.tray_icons[i].window == icon_win do return
+	}
+
+	// Suppress X errors (snixembed windows may be destroyed before we process them)
+	xlib.SetErrorHandler(x_error_handler)
+
+	// Use main display for window ops (same connection as bar_window)
+	xlib.AddToSaveSet(display, icon_win)
+	xlib.SelectInput(display, icon_win, {.StructureNotify, .PropertyChange, .Exposure})
+	xlib.ReparentWindow(display, icon_win, bar_window, -TRAY_ICON_SIZE, -TRAY_ICON_SIZE)
+	xlib.MoveResizeWindow(display, icon_win, -TRAY_ICON_SIZE, -TRAY_ICON_SIZE, TRAY_ICON_SIZE, TRAY_ICON_SIZE)
+	XCompositeRedirectWindow(display, icon_win, COMPOSITE_REDIRECT_MANUAL)
+	xlib.Sync(display, false)
+
+	// Verify the window is still alive and actually reparented
+	verify_attrs: xlib.XWindowAttributes
+	if xlib.GetWindowAttributes(display, icon_win, &verify_attrs) == 0 {
+		return // window was destroyed, skip
+	}
+
+	// Read _XEMBED_INFO to check mapped state
+	mapped := true
+	{
+		act_type: [1]xlib.Atom
+		act_format: [1]i32
+		nitems: [1]uint
+		bytes_after: [1]uint
+		prop: rawptr
+		xlib.GetWindowProperty(
+			display, icon_win, data.xembed_info, 0, 2, false, xlib.Atom(0),
+			raw_data(act_type[:]), raw_data(act_format[:]),
+			raw_data(nitems[:]), raw_data(bytes_after[:]), &prop,
+		)
+		if nitems[0] >= 2 && prop != nil {
+			info := cast([^]c.ulong)prop
+			mapped = (info[1] & XEMBED_MAPPED) != 0
+			xlib.Free(prop)
+		}
+	}
+
+	if mapped {
+		xlib.MapWindow(display, icon_win)
+	}
+
+	// Send XEMBED_EMBEDDED_NOTIFY
+	notify: xlib.XEvent
+	notify.xclient.type = .ClientMessage
+	notify.xclient.window = icon_win
+	notify.xclient.message_type = data.xembed_atom
+	notify.xclient.format = 32
+	notify.xclient.data.l[0] = int(xlib.CurrentTime)
+	notify.xclient.data.l[1] = XEMBED_EMBEDDED_NOTIFY
+	notify.xclient.data.l[2] = 0
+	notify.xclient.data.l[3] = int(bar_window)
+	notify.xclient.data.l[4] = XEMBED_VERSION
+	xlib.SendEvent(display, icon_win, false, {}, &notify)
+
+	data.tray_icons[data.tray_count] = {window = icon_win, mapped = mapped}
+	data.tray_count += 1
+
+	xlib.Flush(display)
+}
+
+tray_remove_icon :: proc(data: ^BarData, icon_win: xlib.Window) {
+	for i in 0 ..< data.tray_count {
+		if data.tray_icons[i].window == icon_win {
+			if data.tray_icons[i].tex_valid {
+				rl.UnloadTexture(data.tray_icons[i].tex)
+			}
+			// Shift remaining icons down
+			for j in i ..< data.tray_count - 1 {
+				data.tray_icons[j] = data.tray_icons[j + 1]
+			}
+			data.tray_count -= 1
+			return
+		}
+	}
+}
+
+// Capture tray icon content from XComposite pixmap into Raylib texture
+tray_capture_icon :: proc(icon: ^TrayIcon, display: ^xlib.Display) {
+	if !icon.mapped do return
+
+	pixmap := XCompositeNameWindowPixmap(display, icon.window)
+	if pixmap == xlib.Pixmap(0) do return
+
+	// Get actual pixmap dimensions (icon may be smaller than TRAY_ICON_SIZE)
+	pw, ph, dummy_border, dummy_depth: u32
+	dummy_root: xlib.Window
+	dummy_x, dummy_y: i32
+	xlib.GetGeometry(display, xlib.Drawable(pixmap), &dummy_root, &dummy_x, &dummy_y, &pw, &ph, &dummy_border, &dummy_depth)
+	w := min(pw, TRAY_ICON_SIZE)
+	h := min(ph, TRAY_ICON_SIZE)
+	if w == 0 || h == 0 {
+		xlib.FreePixmap(display, pixmap)
+		return
+	}
+
+	ximg := xlib.GetImage(display, xlib.Drawable(pixmap), 0, 0, w, h, ~uint(0), .ZPixmap)
+	xlib.FreePixmap(display, pixmap)
+
+	if ximg == nil do return
+
+	// Convert BGRA (X11) to RGBA (Raylib), using bytes_per_line for correct stride.
+	// Depth < 32 means no alpha channel — alpha bytes are undefined (often 0),
+	// so force them to 255 to avoid invisible/black icons.
+	pixels: [TRAY_ICON_SIZE * TRAY_ICON_SIZE * 4]u8
+	src := cast([^]u8)ximg.data
+	stride := int(ximg.bytes_per_line)
+	opaque := ximg.depth < 32
+	for y in 0 ..< int(h) {
+		for x in 0 ..< int(w) {
+			si := y * stride + x * 4
+			di := (y * TRAY_ICON_SIZE + x) * 4
+			pixels[di + 0] = src[si + 2] // R <- B
+			pixels[di + 1] = src[si + 1] // G
+			pixels[di + 2] = src[si + 0] // B <- R
+			pixels[di + 3] = opaque ? 255 : src[si + 3]
+		}
+	}
+	xlib.DestroyImage(ximg)
+
+	img := rl.Image {
+		data    = &pixels,
+		width   = TRAY_ICON_SIZE,
+		height  = TRAY_ICON_SIZE,
+		mipmaps = 1,
+		format  = .UNCOMPRESSED_R8G8B8A8,
+	}
+
+	if icon.tex_valid {
+		rl.UnloadTexture(icon.tex)
+	}
+	icon.tex = rl.LoadTextureFromImage(img)
+	rl.SetTextureFilter(icon.tex, .BILINEAR)
+	icon.tex_valid = true
+}
+
+tray_capture_all :: proc(data: ^BarData, display: ^xlib.Display) {
+	// Prune dead windows (detected via GetWindowAttributes failure)
+	i := 0
+	for i < data.tray_count {
+		attrs: xlib.XWindowAttributes
+		if xlib.GetWindowAttributes(display, data.tray_icons[i].window, &attrs) == 0 {
+			tray_remove_icon(data, data.tray_icons[i].window)
+			// Don't increment i — the array shifted
+		} else {
+			tray_capture_icon(&data.tray_icons[i], display)
+			i += 1
+		}
+	}
+}
+
+handle_tray_input :: proc(data: ^BarData, display: ^xlib.Display) {
+	if data.tray_count == 0 do return
+
+	mx := rl.GetMouseX()
+	my := rl.GetMouseY()
+	if my < 0 || my >= BAR_HEIGHT do return
+
+	// Find which icon was clicked
+	ix := data.tray_x
+	for i in 0 ..< data.tray_count {
+		if !data.tray_icons[i].mapped do continue
+		if mx >= ix && mx < ix + TRAY_ICON_SIZE {
+			// Translate to icon-local coordinates
+			local_x := i32(mx - ix)
+			local_y := i32(my - 4)
+
+			for btn in ([]rl.MouseButton{.LEFT, .MIDDLE, .RIGHT}) {
+				if !rl.IsMouseButtonPressed(btn) do continue
+
+				x11_btn: xlib.MouseButton
+				#partial switch btn {
+				case .LEFT:   x11_btn = .Button1
+				case .MIDDLE: x11_btn = .Button2
+				case .RIGHT:  x11_btn = .Button3
+				case: continue
+				}
+
+				// Send ButtonPress
+				ev: xlib.XEvent
+				ev.xbutton.type = .ButtonPress
+				ev.xbutton.window = data.tray_icons[i].window
+				ev.xbutton.root = xlib.DefaultRootWindow(display)
+				ev.xbutton.x = local_x
+				ev.xbutton.y = local_y
+				ev.xbutton.x_root = mx
+				ev.xbutton.y_root = my
+				ev.xbutton.button = x11_btn
+				ev.xbutton.same_screen = true
+				xlib.SendEvent(display, data.tray_icons[i].window, false, {}, &ev)
+
+				// Send ButtonRelease
+				ev.xbutton.type = .ButtonRelease
+				xlib.SendEvent(display, data.tray_icons[i].window, false, {}, &ev)
+
+				xlib.Flush(display)
+			}
+			return
+		}
+		ix += TRAY_ICON_SIZE + TRAY_ICON_GAP
+	}
+}
+
+tray_has_icon :: proc(data: ^BarData, win: xlib.Window) -> bool {
+	for i in 0 ..< data.tray_count {
+		if data.tray_icons[i].window == win do return true
+	}
+	return false
+}
+
+process_tray_events :: proc(data: ^BarData, display: ^xlib.Display, bar_window: xlib.Window) {
+	if data.tray_display == nil do return
+	td := data.tray_display
+	ev: xlib.XEvent
+
+	// Drain all pending events from the tray connection.
+	// This connection is exclusively ours (GLFW never touches it).
+	for xlib.Pending(td) > 0 {
+		xlib.NextEvent(td, &ev)
+
+		#partial switch ev.type {
+		case .ClientMessage:
+			if ev.xclient.message_type == data.tray_opcode {
+				opcode := ev.xclient.data.l[1]
+				if opcode == SYSTEM_TRAY_REQUEST_DOCK {
+					icon_win := xlib.Window(ev.xclient.data.l[2])
+					if icon_win != xlib.Window(0) {
+						tray_dock_icon(data, display, bar_window, icon_win)
+					}
+				}
+			}
+
+		case: // ignore other events on tray connection
+		}
+	}
+}
+
+cleanup_tray :: proc(data: ^BarData) {
+	if data.tray_display != nil {
+		if data.tray_sel_win != xlib.Window(0) {
+			xlib.SetSelectionOwner(data.tray_display, data.tray_atom, xlib.Window(0), xlib.CurrentTime)
+			xlib.DestroyWindow(data.tray_display, data.tray_sel_win)
+		}
+		xlib.CloseDisplay(data.tray_display)
+		data.tray_display = nil
+	}
+}
 
 measure :: proc(font: rl.Font, text: cstring) -> i32 {
 	return i32(rl.MeasureTextEx(font, text, FONT_SIZE, FONT_SPACING).x)
@@ -764,10 +1129,33 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 	// --- Right: status items ---
 	rx: i32 = screen_w - PAD
 
-	// Time
+	// Time (rightmost)
 	time_text := rl.TextFormat("%s %02d:%02d:%02d", cstring(ICON_CLOCK), data.hour, data.min, data.sec)
 	draw_right(&rx, font, time_text, theme.fg)
 	draw_separator(&rx)
+
+	// System tray icons
+	if data.tray_count > 0 {
+		mapped_count: i32 = 0
+		for i in 0 ..< data.tray_count {
+			if data.tray_icons[i].mapped do mapped_count += 1
+		}
+		if mapped_count > 0 {
+			tray_total := mapped_count * (TRAY_ICON_SIZE + TRAY_ICON_GAP) - TRAY_ICON_GAP
+			rx -= tray_total
+			data.tray_x = rx
+			ix := rx
+			for i in 0 ..< data.tray_count {
+				if !data.tray_icons[i].mapped do continue
+				if data.tray_icons[i].tex_valid {
+					rl.DrawTexture(data.tray_icons[i].tex, ix, 4, rl.WHITE)
+				}
+				ix += TRAY_ICON_SIZE + TRAY_ICON_GAP
+			}
+			rx -= PAD
+			draw_separator(&rx)
+		}
+	}
 
 	// Weather
 	{
@@ -778,26 +1166,28 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 	}
 
 	// Battery
-	bat_col := data.battery_pct > 50 ? theme.green : (data.battery_pct > 20 ? theme.yellow : theme.red)
-	bat_icon: cstring
-	if data.charging {
-		bat_icon = cstring(ICON_BOLT)
-	} else if data.battery_pct > 75 {
-		bat_icon = cstring(ICON_BAT_FULL)
-	} else if data.battery_pct > 50 {
-		bat_icon = cstring(ICON_BAT_3Q)
-	} else if data.battery_pct > 25 {
-		bat_icon = cstring(ICON_BAT_HALF)
-	} else if data.battery_pct > 10 {
-		bat_icon = cstring(ICON_BAT_LOW)
-	} else {
-		bat_icon = cstring(ICON_BAT_EMPTY)
+	if data.has_battery {
+		bat_col := data.battery_pct > 50 ? theme.green : (data.battery_pct > 20 ? theme.yellow : theme.red)
+		bat_icon: cstring
+		if data.charging {
+			bat_icon = cstring(ICON_BOLT)
+		} else if data.battery_pct > 75 {
+			bat_icon = cstring(ICON_BAT_FULL)
+		} else if data.battery_pct > 50 {
+			bat_icon = cstring(ICON_BAT_3Q)
+		} else if data.battery_pct > 25 {
+			bat_icon = cstring(ICON_BAT_HALF)
+		} else if data.battery_pct > 10 {
+			bat_icon = cstring(ICON_BAT_LOW)
+		} else {
+			bat_icon = cstring(ICON_BAT_EMPTY)
+		}
+		bat_text := rl.TextFormat("%s %d%%", bat_icon, data.battery_pct)
+		bx, bw := draw_right(&rx, font, bat_text, bat_col)
+		data.bat_x = bx - 4
+		data.bat_w = bw + PAD + 8
+		draw_separator(&rx)
 	}
-	bat_text := rl.TextFormat("%s %d%%", bat_icon, data.battery_pct)
-	bx, bw := draw_right(&rx, font, bat_text, bat_col)
-	data.bat_x = bx - 4
-	data.bat_w = bw + PAD + 8
-	draw_separator(&rx)
 
 	// Volume — record hit region for mouse interaction
 	if data.muted {
@@ -983,6 +1373,8 @@ handle_volume_input :: proc(data: ^BarData) {
 // ---------------------------------------------------------------------------
 
 handle_battery_input :: proc(data: ^BarData) {
+	if !data.has_battery do return
+
 	mx := rl.GetMouseX()
 	my := rl.GetMouseY()
 
@@ -1005,7 +1397,7 @@ handle_battery_input :: proc(data: ^BarData) {
 }
 
 draw_battery_tooltip :: proc(data: ^BarData, font: rl.Font) {
-	if data.bat_tooltip <= 0 do return
+	if !data.has_battery || data.bat_tooltip <= 0 do return
 
 	tip: cstring
 	if data.bat_time_len > 0 {
@@ -1130,10 +1522,19 @@ main :: proc() {
 	defer rl.UnloadTexture(noise_tex)
 
 	x_display := glfw.GetX11Display()
+	bar_x11_win := glfw.GetX11Window(cast(glfw.WindowHandle)rl.GetWindowHandle())
 
 	data: BarData
 	data.focused_idx = -1
 	data.kbd_layout = "??"
+
+	// System tray
+	setup_tray(&data, x_display, bar_x11_win)
+	defer cleanup_tray(&data)
+
+	// Launch snixembed to bridge SNI/AppIndicator apps into XEmbed tray
+	run_cmd_fire("pkill -x snixembed 2>/dev/null; sleep 0.2; snixembed 2>/dev/null &")
+	defer run_cmd_fire("pkill -x snixembed 2>/dev/null")
 
 	// bspc subscribe for instant workspace events
 	sub := bspc_sub_open()
@@ -1152,6 +1553,9 @@ main :: proc() {
 	for !rl.WindowShouldClose() {
 		now := rl.GetTime()
 
+		// --- System tray events ---
+		process_tray_events(&data, x_display, bar_x11_win)
+
 		// --- Instant workspace updates via bspc subscribe ---
 		if sub.pipe == nil {
 			sub = bspc_sub_open() // reconnect if died
@@ -1166,6 +1570,7 @@ main :: proc() {
 			last_fast = now
 			update_window_info(&data, x_display)
 			update_kbd_layout(&data, x_display)
+			tray_capture_all(&data, x_display)
 
 			// Check fullscreen state
 			fs := is_fullscreen(x_display)
@@ -1201,6 +1606,7 @@ main :: proc() {
 		handle_battery_input(&data)
 		handle_kbd_input(&data, x_display)
 		handle_media_input(&data)
+		handle_tray_input(&data, x_display)
 
 		// --- Cursor ---
 		{
@@ -1212,7 +1618,7 @@ main :: proc() {
 				// Volume
 				if mx >= data.vol_x && mx <= data.vol_x + data.vol_w do hand = true
 				// Battery
-				if mx >= data.bat_x && mx <= data.bat_x + data.bat_w do hand = true
+				if data.has_battery && mx >= data.bat_x && mx <= data.bat_x + data.bat_w do hand = true
 				// Kbd
 				if mx >= data.kbd_x && mx <= data.kbd_x + data.kbd_w do hand = true
 				// Media buttons
