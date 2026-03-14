@@ -1085,48 +1085,7 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 		x += ws_w + 4
 	}
 
-	// --- Center: icon + window title ---
-	if data.title_len > 0 {
-		title := buf_cstr(data.title_buf[:])
-		title_w := f32(measure(font, title))
-		max_w := f32(TITLE_MAX_W)
-
-		icon_size := f32(BAR_HEIGHT - 8)
-		icon_gap := data.icon_valid ? icon_size + 6 : f32(0)
-		visible_title_w := min(title_w, max_w)
-		content_w := icon_gap + visible_title_w
-		start_x := (f32(screen_w) * 0.38) - content_w / 2
-
-		if data.icon_valid {
-			aspect := f32(data.icon_tex.width) / max(f32(data.icon_tex.height), 1)
-			iw := icon_size * aspect
-			rl.DrawTexturePro(
-				data.icon_tex,
-				{0, 0, f32(data.icon_tex.width), f32(data.icon_tex.height)},
-				{start_x, 4, iw, icon_size},
-				{0, 0}, 0, rl.WHITE,
-			)
-		}
-
-		title_x := i32(start_x + icon_gap)
-
-		if title_w <= max_w {
-			draw_text(font, title, title_x, theme.fg)
-			data.title_scroll = 0
-		} else {
-			data.title_scroll += TITLE_SCROLL_SPEED * dt
-			cycle := title_w + TITLE_GAP
-			if data.title_scroll >= cycle {
-				data.title_scroll -= cycle
-			}
-			rl.BeginScissorMode(title_x, 0, i32(max_w), BAR_HEIGHT)
-			draw_text(font, title, title_x - i32(data.title_scroll), theme.fg)
-			draw_text(font, title, title_x + i32(cycle - data.title_scroll), theme.fg)
-			rl.EndScissorMode()
-		}
-	}
-
-	// --- Right: status items ---
+	// --- Right: status items (drawn right-to-left) ---
 	rx: i32 = screen_w - PAD
 
 	// Time (rightmost)
@@ -1212,64 +1171,99 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i
 		data.kbd_w = kw + PAD + 8
 	}
 
-	// Media (playerctl) — left of kbd widget
-	if data.media_active && data.media_len > 0 {
-		draw_separator(&rx)
+	// --- Center: title and media split the area between workspaces and kbd ---
+	ws_end := x + PAD
+	right_start := rx
+	center_w := right_start - ws_end
 
-		// Buttons: prev | play/pause | next
-		btn_w := i32(measure(emoji_font, cstring(ICON_NEXT))) + 8
-		data.btn_w = btn_w
-		btn_gap: i32 = 2
+	if center_w > 0 {
+		half_w := center_w / 2
 
-		// Next button (rightmost)
-		rx -= btn_w
-		data.btn_next_x = rx
-		draw_text(emoji_font, cstring(ICON_NEXT), rx + 4, theme.fg_dim)
+		// Left half: icon + window title
+		if data.title_len > 0 {
+			title := buf_cstr(data.title_buf[:])
+			title_w := f32(measure(font, title))
+			icon_size := f32(BAR_HEIGHT - 8)
+			icon_gap := data.icon_valid ? icon_size + 6 : f32(0)
+			max_w := f32(half_w - PAD) - icon_gap
+			if max_w < 0 do max_w = 0
 
-		rx -= btn_gap
+			start_x := f32(ws_end)
 
-		// Play/pause button
-		rx -= btn_w
-		data.btn_play_x = rx
-		play_icon: cstring = data.media_playing ? cstring(ICON_PAUSE) : cstring(ICON_PLAY)
-		draw_text(emoji_font, play_icon, rx + 4, theme.accent)
-
-		rx -= btn_gap
-
-		// Prev button
-		rx -= btn_w
-		data.btn_prev_x = rx
-		draw_text(emoji_font, cstring(ICON_PREV), rx + 4, theme.fg_dim)
-
-		rx -= 6
-
-		// Song text with marquee
-		media_text := buf_cstr(data.media_buf[:])
-		media_full_w := f32(measure(font, media_text))
-		media_max := f32(MEDIA_MAX_W)
-		visible_media_w := i32(min(media_full_w, media_max))
-
-		rx -= visible_media_w
-		text_x := rx
-
-		if media_full_w <= media_max {
-			draw_text(font, media_text, text_x, theme.fg_dim)
-			data.media_scroll = 0
-		} else {
-			data.media_scroll += MEDIA_SCROLL_SPEED * dt
-			cycle := media_full_w + TITLE_GAP
-			if data.media_scroll >= cycle {
-				data.media_scroll -= cycle
+			if data.icon_valid {
+				aspect := f32(data.icon_tex.width) / max(f32(data.icon_tex.height), 1)
+				iw := icon_size * aspect
+				rl.DrawTexturePro(
+					data.icon_tex,
+					{0, 0, f32(data.icon_tex.width), f32(data.icon_tex.height)},
+					{start_x, 4, iw, icon_size},
+					{0, 0}, 0, rl.WHITE,
+				)
 			}
-			rl.BeginScissorMode(text_x, 0, i32(media_max), BAR_HEIGHT)
-			draw_text(font, media_text, text_x - i32(data.media_scroll), theme.fg_dim)
-			draw_text(font, media_text, text_x + i32(cycle - data.media_scroll), theme.fg_dim)
-			rl.EndScissorMode()
+
+			title_x := i32(start_x + icon_gap)
+
+			if title_w <= max_w {
+				draw_text(font, title, title_x, theme.fg)
+				data.title_scroll = 0
+			} else if max_w > 0 {
+				data.title_scroll += TITLE_SCROLL_SPEED * dt
+				cycle := title_w + TITLE_GAP
+				if data.title_scroll >= cycle {
+					data.title_scroll -= cycle
+				}
+				rl.BeginScissorMode(title_x, 0, i32(max_w), BAR_HEIGHT)
+				draw_text(font, title, title_x - i32(data.title_scroll), theme.fg)
+				draw_text(font, title, title_x + i32(cycle - data.title_scroll), theme.fg)
+				rl.EndScissorMode()
+			}
 		}
 
-		rx -= PAD
-	} else {
-		data.btn_w = 0
+		// Right half: media (playerctl)
+		media_x := ws_end + half_w
+		media_w := half_w - PAD
+		if data.media_active && data.media_len > 0 && media_w > 0 {
+			// Buttons on the right side of the half
+			btn_w := i32(measure(emoji_font, cstring(ICON_NEXT))) + 8
+			data.btn_w = btn_w
+			btn_gap: i32 = 2
+			buttons_total := 3 * btn_w + 2 * btn_gap
+
+			btn_base := media_x + media_w - buttons_total
+			data.btn_prev_x = btn_base
+			draw_text(emoji_font, cstring(ICON_PREV), btn_base + 4, theme.fg_dim)
+
+			data.btn_play_x = btn_base + btn_w + btn_gap
+			play_icon: cstring = data.media_playing ? cstring(ICON_PAUSE) : cstring(ICON_PLAY)
+			draw_text(emoji_font, play_icon, data.btn_play_x + 4, theme.accent)
+
+			data.btn_next_x = btn_base + 2 * (btn_w + btn_gap)
+			draw_text(emoji_font, cstring(ICON_NEXT), data.btn_next_x + 4, theme.fg_dim)
+
+			// Song text with marquee in remaining space
+			song_max := f32(media_w - buttons_total - 12)
+			if song_max > 0 {
+				media_text := buf_cstr(data.media_buf[:])
+				media_full_w := f32(measure(font, media_text))
+
+				if media_full_w <= song_max {
+					draw_text(font, media_text, media_x, theme.fg_dim)
+					data.media_scroll = 0
+				} else {
+					data.media_scroll += MEDIA_SCROLL_SPEED * dt
+					cycle := media_full_w + TITLE_GAP
+					if data.media_scroll >= cycle {
+						data.media_scroll -= cycle
+					}
+					rl.BeginScissorMode(media_x, 0, i32(song_max), BAR_HEIGHT)
+					draw_text(font, media_text, media_x - i32(data.media_scroll), theme.fg_dim)
+					draw_text(font, media_text, media_x + i32(cycle - data.media_scroll), theme.fg_dim)
+					rl.EndScissorMode()
+				}
+			}
+		} else {
+			data.btn_w = 0
+		}
 	}
 }
 
