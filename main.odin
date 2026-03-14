@@ -525,7 +525,7 @@ update_time :: proc(data: ^BarData) {
 
 update_volume :: proc(data: ^BarData) {
 	buf: [BUF_SM]u8
-	n := run_cmd("pamixer --get-volume 2>/dev/null", buf[:])
+	n := run_cmd("pactl get-sink-volume @DEFAULT_SINK@ 2>/dev/null | sed 's/.*\\/\\s*\\([0-9]*\\)%.*/\\1/' | head -1", buf[:])
 	if n > 0 {
 		v, ok := strconv.parse_int(string(buf[:n]))
 		if ok do data.volume = i32(v)
@@ -1328,16 +1328,16 @@ handle_volume_input :: proc(data: ^BarData) {
 	// Scroll wheel: adjust volume
 	wheel := rl.GetMouseWheelMove()
 	if wheel > 0 {
-		run_cmd_fire("pamixer -i 5")
+		run_cmd_fire("pactl set-sink-volume @DEFAULT_SINK@ +5%")
 		update_volume(data)
 	} else if wheel < 0 {
-		run_cmd_fire("pamixer -d 5")
+		run_cmd_fire("pactl set-sink-volume @DEFAULT_SINK@ -5%")
 		update_volume(data)
 	}
 
 	// Click: toggle mute
 	if rl.IsMouseButtonPressed(.LEFT) {
-		run_cmd_fire("pamixer -t")
+		run_cmd_fire("pactl set-sink-mute @DEFAULT_SINK@ toggle")
 		update_volume(data)
 	}
 }
