@@ -1621,14 +1621,8 @@ main :: proc() {
 			update_window_info(&data, x_display)
 		}
 
-		// --- Periodic polls ---
-		if now - last_fast >= 0.5 {
-			last_fast = now
-			update_window_info(&data, x_display)
-			update_kbd_layout(&data, x_display)
-			tray_capture_all(&data, x_display)
-
-			// Check fullscreen state
+		// Check fullscreen state every frame
+		{
 			fs := is_fullscreen(x_display)
 			if fs != data.hidden {
 				data.hidden = fs
@@ -1638,6 +1632,14 @@ main :: proc() {
 					rl.SetWindowPosition(mon_x, mon_y)
 				}
 			}
+		}
+
+		// --- Periodic polls ---
+		if now - last_fast >= 0.5 {
+			last_fast = now
+			update_window_info(&data, x_display)
+			update_kbd_layout(&data, x_display)
+			tray_capture_all(&data, x_display)
 		}
 
 		if now - last_medium >= 1.0 {
