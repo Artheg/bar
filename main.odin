@@ -74,10 +74,12 @@ ICON_VOL_HIGH :: "\xef\x80\xa8"
 ICON_VOL_LOW :: "\xef\x80\xa7"
 ICON_VOL_MUTE :: "\xef\x80\xa6"
 ICON_KBD :: "\xef\x84\x9c"
-ICON_PLAY :: "\xef\x80\x9a"
-ICON_PAUSE :: "\xef\x80\x9c"
-ICON_PREV :: "\xef\x80\x88"
-ICON_NEXT :: "\xef\x80\x89"
+ICON_PREV :: "\xe2\x8f\xae"   // ⏮ U+23EE
+ICON_PLAY :: "\xe2\x96\xb6"   // ▶ U+25B6
+ICON_PAUSE :: "\xe2\x8f\xb8"  // ⏸ U+23F8
+ICON_NEXT :: "\xe2\x8f\xad"   // ⏭ U+23ED
+
+EMOJI_FONT_PATH :: "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf"
 
 MEDIA_MAX_W :: 350
 MEDIA_SCROLL_SPEED :: f32(35)
@@ -315,7 +317,7 @@ BspcSub :: struct {
 }
 
 bspc_sub_open :: proc() -> BspcSub {
-	pipe := popen("bspc subscribe desktop_focus node_add node_remove node_transfer", "r")
+	pipe := popen("bspc subscribe desktop_focus node_focus node_add node_remove node_transfer", "r")
 	fd: c.int = -1
 	if pipe != nil do fd = fileno(pipe)
 	return {pipe, fd}
@@ -506,6 +508,8 @@ load_font :: proc() -> rl.Font {
 	for cp in rune(0x2100) ..= rune(0x214F) {append(&codepoints, cp)}
 	for cp in rune(0x2190) ..= rune(0x21FF) {append(&codepoints, cp)}
 	for cp in rune(0x2200) ..= rune(0x22FF) {append(&codepoints, cp)}
+	for cp in rune(0x2300) ..= rune(0x23FF) {append(&codepoints, cp)} // Misc Technical (⏮⏭⏸)
+	for cp in rune(0x25A0) ..= rune(0x25FF) {append(&codepoints, cp)} // Geometric Shapes (▶)
 	for cp in rune(0x2600) ..= rune(0x26FF) {append(&codepoints, cp)}
 	for cp in rune(0x2700) ..= rune(0x27BF) {append(&codepoints, cp)}
 	for cp in rune(0x3000) ..= rune(0x303F) {append(&codepoints, cp)}
@@ -527,6 +531,13 @@ load_font :: proc() -> rl.Font {
 	}
 
 	font := rl.LoadFontEx(FONT_PATH, FONT_SIZE, raw_data(codepoints[:]), i32(len(codepoints)))
+	rl.SetTextureFilter(font.texture, .BILINEAR)
+	return font
+}
+
+load_emoji_font :: proc() -> rl.Font {
+	codepoints := [?]rune{0x23ED, 0x23EE, 0x23F8, 0x25B6}
+	font := rl.LoadFontEx(EMOJI_FONT_PATH, FONT_SIZE, raw_data(codepoints[:]), i32(len(codepoints)))
 	rl.SetTextureFilter(font.texture, .BILINEAR)
 	return font
 }
@@ -629,7 +640,7 @@ draw_separator :: proc(rx: ^i32) {
 // Main render
 // ---------------------------------------------------------------------------
 
-draw_bar :: proc(data: ^BarData, font: rl.Font, screen_w: i32) {
+draw_bar :: proc(data: ^BarData, font: rl.Font, emoji_font: rl.Font, screen_w: i32) {
 	dt := rl.GetFrameTime()
 
 	// --- Left: workspaces ---
@@ -697,8 +708,10 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, screen_w: i32) {
 	draw_separator(&rx)
 
 	// Weather
-	if data.weather_len > 0 {
-		draw_right(&rx, font, buf_cstr(data.weather_buf[:]), FG_DIM)
+	{
+		weather_text: cstring = data.weather_len > 0 ? buf_cstr(data.weather_buf[:]) : "Loading..."
+		weather_col: rl.Color = data.weather_len > 0 ? FG_DIM : SURFACE
+		draw_right(&rx, font, weather_text, weather_col)
 		draw_separator(&rx)
 	}
 
@@ -750,14 +763,14 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, screen_w: i32) {
 		draw_separator(&rx)
 
 		// Buttons: prev | play/pause | next
-		btn_w := i32(measure(font, cstring(ICON_NEXT))) + 8
+		btn_w := i32(measure(emoji_font, cstring(ICON_NEXT))) + 8
 		data.btn_w = btn_w
 		btn_gap: i32 = 2
 
 		// Next button (rightmost)
 		rx -= btn_w
 		data.btn_next_x = rx
-		draw_text(font, cstring(ICON_NEXT), rx + 4, FG_DIM)
+		draw_text(emoji_font, cstring(ICON_NEXT), rx + 4, FG_DIM)
 
 		rx -= btn_gap
 
@@ -765,14 +778,14 @@ draw_bar :: proc(data: ^BarData, font: rl.Font, screen_w: i32) {
 		rx -= btn_w
 		data.btn_play_x = rx
 		play_icon: cstring = data.media_playing ? cstring(ICON_PAUSE) : cstring(ICON_PLAY)
-		draw_text(font, play_icon, rx + 4, ACCENT)
+		draw_text(emoji_font, play_icon, rx + 4, ACCENT)
 
 		rx -= btn_gap
 
 		// Prev button
 		rx -= btn_w
 		data.btn_prev_x = rx
-		draw_text(font, cstring(ICON_PREV), rx + 4, FG_DIM)
+		draw_text(emoji_font, cstring(ICON_PREV), rx + 4, FG_DIM)
 
 		rx -= 6
 
@@ -904,6 +917,9 @@ main :: proc() {
 	font := load_font()
 	defer rl.UnloadFont(font)
 
+	emoji_font := load_emoji_font()
+	defer rl.UnloadFont(emoji_font)
+
 	x_display := glfw.GetX11Display()
 
 	data: BarData
@@ -1000,7 +1016,7 @@ main :: proc() {
 		// --- Render ---
 		rl.BeginDrawing()
 		rl.ClearBackground(BG)
-		draw_bar(&data, font, screen_w)
+		draw_bar(&data, font, emoji_font, screen_w)
 		rl.EndDrawing()
 	}
 
